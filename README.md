@@ -1,6 +1,8 @@
+<img src="./mqe.png" width="400px"></img>
+
 ## Multistep Quasimetric Estimation - (wip)
 
-Exploration and eventually practical implementation for the (Multistep Quasimetric Estimation)[https://arxiv.org/abs/2511.07730] proposed by Zheng et al. of Berkeley
+Exploration and eventually practical implementation for the [Multistep Quasimetric Estimation](https://arxiv.org/abs/2511.07730) proposed by Zheng et al. of Berkeley
 
 ## Citations
 

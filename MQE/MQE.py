@@ -24,7 +24,7 @@ def divisible_by(num, den):
 def default_sym_fn(x, y):
     return (x - y).norm(p = 2, dim = -1)
 
-def default_sym_fn(x, y):
+def default_asym_fn(x, y):
     return (x - y).relu().amax(dim = -1)
 
 def quasimetric_distance(
@@ -33,7 +33,7 @@ def quasimetric_distance(
     asym_y = None,
     *,
     sym_fn = default_sym_fn,
-    asym_fn = default_sym_fn,
+    asym_fn = default_asym_fn,
     groups = 8 # the paper splits the representation into N equally sized components (Table 2 uses 8)
 ):
     dim_embed = x.shape[-1]
@@ -53,7 +53,7 @@ def quasimetric_distance(
 
     # asymmetric
 
-    asym = asym_fn(x, y)
+    asym = asym_fn(asym_x, asym_y)
 
     # eq (4)
 
