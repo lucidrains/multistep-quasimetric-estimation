@@ -15,3 +15,15 @@ Exploration and eventually practical implementation for the (Multistep Quasimetr
     url     = {https://arxiv.org/abs/2511.07730},
 }
 ```
+
+```bibtex
+@misc{liu2023metricresidualnetworkssample,
+    title   = {Metric Residual Networks for Sample Efficient Goal-Conditioned Reinforcement Learning},
+    author  = {Bo Liu and Yihao Feng and Qiang Liu and Peter Stone},
+    year    = {2023},
+    eprint  = {2208.08133},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2208.08133},
+}
+```

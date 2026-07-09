@@ -1,2 +1,5 @@
 
-from MQE.MQE import MQE
+from MQE.MQE import (
+    MQE,
+    quasimetric_distance
+)
