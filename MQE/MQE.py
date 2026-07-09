@@ -141,7 +141,7 @@ class MultistepQuasimetricEstimation(Module):
 
         # section 4.2
 
-        loss_action_invariance = F.mse_loss((-dist_action_invariance).exp(), torch.ones_like(dist_action_invariance))
+        loss_action_invariance = F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
 
         return distance, loss_action_invariance
 
