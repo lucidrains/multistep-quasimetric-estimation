@@ -124,6 +124,17 @@ class MultistepQuasimetricEstimation(Module):
         super().__init__()
         self.mrn = metric_residual_network
 
+    def calc_action_invariance_loss(
+        self,
+        states,
+        actions
+    ):
+        dist_action_invariance = self.mrn((states, actions), states, calc_reverse_distance = True, reduce_groups = False) # (... g)
+
+        # section 4.2
+
+        return F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
+
     def forward(
         self,
         states,
@@ -137,11 +148,7 @@ class MultistepQuasimetricEstimation(Module):
         if not return_action_invariance_loss:
             return distance
 
-        dist_action_invariance = self.mrn((states, actions), states, calc_reverse_distance = True, reduce_groups = False) # (... g)
-
-        # section 4.2
-
-        loss_action_invariance = F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
+        loss_action_invariance = self.calc_action_invariance_loss(states, actions)
 
         return distance, loss_action_invariance
 
