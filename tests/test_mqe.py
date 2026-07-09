@@ -2,14 +2,27 @@ import pytest
 param = pytest.mark.parametrize
 
 import torch
+import torch.nn.functional as F
 
-def test_quasimetric_distance():
+@param('custom_fn', (False, True))
+def test_quasimetric_distance(
+    custom_fn
+):
     from MQE.MQE import quasimetric_distance
 
     x = torch.randn(32)
     y = torch.randn(32)
 
-    dist = quasimetric_distance(x, y)
+    dist_kwargs = dict()
+
+    if custom_fn:
+        dist_kwargs = dict(
+            sym_fn = lambda x, y: (x - y).abs().sum(dim = -1),
+            asym_fn = lambda x, y: F.softplus(x - y).logsumexp(dim = -1)
+        )
+
+    dist = quasimetric_distance(x, y, **dist_kwargs)
+
     assert dist.numel() == 1
 
 def test_mrn():
