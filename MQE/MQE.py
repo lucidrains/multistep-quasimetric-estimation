@@ -6,6 +6,8 @@ from torch.nn import Module, ModuleList
 
 from einops import rearrange, reduce
 
+from x_mlps_pytorch import create_mlp
+
 # helpers
 
 def exists(v):
@@ -21,28 +23,28 @@ def divisible_by(num, den):
 
 def quasimetric_distance(
     x, y,
+    asym_x = None,
+    asym_y = None,
     groups = 8 # the paper splits the representation into N equally sized components (Table 2 uses 8)
 ):
     dim_embed = x.shape[-1]
 
-    assert x.shape == y.shape
+    asym_x, asym_y = default(asym_x, x), default(asym_y, y)
+
+    assert x.shape == y.shape == asym_x.shape == asym_y.shape
     assert divisible_by(dim_embed, groups)
 
     # separate out groups
 
-    x, y = (rearrange(t, '... (g d) -> ... g d', g = groups) for t in (x, y))
-
-    # diff
-
-    diff = x - y
+    x, y, asym_x, asym_y = (rearrange(t, '... (g d) -> ... g d', g = groups) for t in (x, y, asym_x, asym_y))
 
     # symmetric
 
-    sym = diff.norm(p = 2, dim = -1)
+    sym = (x - y).norm(p = 2, dim = -1)
 
     # asymmetric
 
-    asym = diff.relu().amax(dim = -1)
+    asym = (asym_x - asym_y).relu().amax(dim = -1)
 
     # eq (4)
 
@@ -51,6 +53,46 @@ def quasimetric_distance(
     # average
 
     return reduce(distance, '... g -> ...', 'mean')
+
+# metric residual network
+# https://arxiv.org/abs/2208.08133
+
+class MetricResidualNetwork(Module):
+    def __init__(
+        self,
+        *,
+        encoders: list[Module],
+        sym_network: Module,
+        asym_network: Module,
+        distance_groups = 8
+    ):
+        super().__init__()
+
+        # encoders - would be state-action and state-goal for MEQ
+
+        self.encoders = ModuleList(encoders)
+
+        # the two network backbones, producing inputs for symmetric and asymmetric half of quasimetric distance
+
+        self.sym_network = sym_network
+        self.asym_network = asym_network
+
+        # distance related
+
+        self.distance_groups = distance_groups
+
+    def forward(
+        self,
+        *encoder_inputs
+    ):
+        encoded = [fn(inputs) for fn, inputs in zip(self.encoders, encoder_inputs)]
+
+        sym_x, sym_y = [self.sym_network(t) for t in encoded]
+        asym_x, asym_y = [self.asym_network(t) for t in encoded]
+
+        dist = quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups)
+
+        return -dist
 
 # classes
 
