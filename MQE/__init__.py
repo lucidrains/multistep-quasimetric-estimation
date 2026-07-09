@@ -1,6 +1,8 @@
 
 from MQE.MQE import (
-    MQE,
     MetricResidualNetwork,
-    quasimetric_distance
+    MultistepQuasimetricEstimation,
+    quasimetric_distance,
+    MRN,
+    MQE
 )

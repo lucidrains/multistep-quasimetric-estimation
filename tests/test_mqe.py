@@ -34,7 +34,7 @@ def test_mrn():
     dim_goal = 10
 
     mrn = MetricResidualNetwork(
-        encoders = [MLP(dim_state + dim_action, 32, 16), MLP(dim_state + dim_goal, 32, 16)],
+        encoders = [MLP(dim_state + dim_action, 32, 16), MLP(dim_goal, 32, 16)],
         sym_network = MLP(16, 32),
         asym_network = MLP(16, 32)
     )
@@ -43,8 +43,33 @@ def test_mrn():
     actions = torch.rand(2)
     goal = torch.randn(10)
 
-    distance = mrn((state, actions), (state, goal))
+    distance = mrn((state, actions), goal)
     distance.backward()
 
 def test_mqe():
-    assert True
+    from x_mlps_pytorch import MLP
+    from MQE import MQE, MRN
+
+    dim_state = 10
+    dim_action = 2
+    dim_goal = 10
+
+    mrn = MRN(
+        encoders = [MLP(dim_state + dim_action, 32, 16), MLP(dim_goal, 32, 16)],
+        sym_network = MLP(16, 32),
+        asym_network = MLP(16, 32)
+    )
+
+    mqe = MQE(mrn)
+
+    states = torch.randn(4, 10)
+    actions = torch.rand(4, 2)
+    goals = torch.randn(4, 10)
+
+    distance, action_inv_loss = mqe(states, actions, goals, return_action_invariance_loss=True)
+
+    assert distance.shape == (4,)
+    assert action_inv_loss.numel() == 1
+
+    loss = distance.mean() + action_inv_loss
+    loss.backward()

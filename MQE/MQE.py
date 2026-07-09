@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
 from einops import rearrange, reduce
@@ -34,7 +35,8 @@ def quasimetric_distance(
     *,
     sym_fn = default_sym_fn,
     asym_fn = default_asym_fn,
-    groups = 8 # the paper splits the representation into N equally sized components (Table 2 uses 8)
+    groups = 8, # the paper splits the representation into N equally sized components (Table 2 uses 8)
+    reduce_groups = True
 ):
     dim_embed = x.shape[-1]
 
@@ -59,6 +61,11 @@ def quasimetric_distance(
 
     distance = sym + asym
 
+    # maybe not reduce, for action invariance loss
+
+    if not reduce_groups:
+        return distance
+
     # average
 
     return reduce(distance, '... g -> ...', 'mean')
@@ -70,7 +77,7 @@ class MetricResidualNetwork(Module):
     def __init__(
         self,
         *,
-        encoders: list[Module],
+        encoders: tuple[Module, Module],
         sym_network: Module,
         asym_network: Module,
         distance_groups = 8
@@ -79,7 +86,7 @@ class MetricResidualNetwork(Module):
 
         # encoders - would be state-action and state-goal for MEQ
 
-        self.encoders = ModuleList(encoders)
+        self.encoders = ModuleList(list(encoders))
 
         # the two network backbones, producing inputs for symmetric and asymmetric half of quasimetric distance
 
@@ -92,27 +99,53 @@ class MetricResidualNetwork(Module):
 
     def forward(
         self,
-        *encoder_inputs
+        *encoder_inputs,
+        calc_reverse_distance = False,
+        reduce_groups = True
     ):
         encoded = [fn(inputs) for fn, inputs in zip(self.encoders, encoder_inputs)]
 
         sym_x, sym_y = [self.sym_network(t) for t in encoded]
         asym_x, asym_y = [self.asym_network(t) for t in encoded]
 
-        dist = quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups)
+        if calc_reverse_distance:
+            sym_x, sym_y = sym_y, sym_x
+            asym_x, asym_y = asym_y, asym_x
 
-        return -dist
+        return quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups, reduce_groups = reduce_groups)
 
 # classes
 
-class MQE(Module):
+class MultistepQuasimetricEstimation(Module):
     def __init__(
-        self
+        self,
+        metric_residual_network: MetricResidualNetwork,
     ):
         super().__init__()
+        self.mrn = metric_residual_network
 
     def forward(
         self,
-        state
+        states,
+        actions,
+        goals,
+        return_action_invariance_loss = False
     ):
-        return state
+
+        distance = self.mrn((states, actions), goals)
+
+        if not return_action_invariance_loss:
+            return distance
+
+        dist_action_invariance = self.mrn((states, actions), states, calc_reverse_distance = True, reduce_groups = False) # (... g)
+
+        # section 4.2
+
+        loss_action_invariance = F.mse_loss((-dist_action_invariance).exp(), torch.ones_like(dist_action_invariance))
+
+        return distance, loss_action_invariance
+
+# shorthand
+
+MRN = MetricResidualNetwork
+MQE = MultistepQuasimetricEstimation
