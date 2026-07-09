@@ -17,6 +17,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -103,14 +106,11 @@ class MetricResidualNetwork(Module):
         calc_reverse_distance = False,
         reduce_groups = True
     ):
-        encoded = [fn(inputs) for fn, inputs in zip(self.encoders, encoder_inputs)]
+        maybe_reverse = reversed if calc_reverse_distance else identity
+        encoded = [fn(inputs) for fn, inputs in maybe_reverse(list(zip(self.encoders, encoder_inputs)))]
 
         sym_x, sym_y = [self.sym_network(t) for t in encoded]
         asym_x, asym_y = [self.asym_network(t) for t in encoded]
-
-        if calc_reverse_distance:
-            sym_x, sym_y = sym_y, sym_x
-            asym_x, asym_y = asym_y, asym_x
 
         return quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups, reduce_groups = reduce_groups)
 
