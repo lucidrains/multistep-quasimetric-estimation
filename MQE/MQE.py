@@ -15,7 +15,7 @@ from einops.layers.torch import Rearrange
 
 import torchvision.models as models
 from torch.distributions import Categorical, Normal, Beta
-from x_mlps_pytorch import FiLMableMLP
+from x_mlps_pytorch import create_filmable_mlp
 
 # helpers
 
@@ -147,6 +147,53 @@ class Critic(Module):
         self.paired_loss_weight = paired_loss_weight
         self.has_paired_loss_weight = paired_loss_weight > 0
 
+        self.register_buffer('zero', torch.tensor(0.), persistent = False)
+
+    def extract_policy(
+        self,
+        policy: Module,
+        states,
+        actions,
+        goals,
+        bc_loss_weight = 0.1,
+        is_image = False
+    ):
+        # extracts goal-conditioned policy using behavior-regularization
+
+        batch, device = states.shape[0], states.device
+
+        is_seq = states.ndim == (5 if is_image else 3)
+
+        if is_seq:
+            states = states[:, 0]
+            actions = actions[:, 0]
+            goals = goals[:, -1]
+
+        # behavior cloning loss
+
+        action_dist = policy(states, goals)
+
+        bc_loss = self.zero
+
+        if bc_loss_weight > 0.:
+            log_prob = action_dist.log_prob(actions)
+            log_prob = reduce(log_prob, 'b ... -> b', 'sum')
+            bc_loss = -log_prob.mean()
+
+        # minimize distance is the same as maximizing Q
+
+        rand_indices = torch.randperm(batch, device = device)
+        goals_j = goals[rand_indices]
+
+        action_dist_j = policy(states, goals_j)
+        pred_actions_j = action_dist_j.rsample()
+
+        q_loss = self.actor_loss(states, pred_actions_j, goals_j)
+
+        total_loss = q_loss + bc_loss_weight * bc_loss
+
+        return total_loss, (q_loss, bc_loss)
+
     def forward(
         self,
         states,
@@ -225,7 +272,8 @@ class Critic(Module):
 
         return dist_q_to_goal.mean()
 
-# classes
+# main classe
+
 class MultistepQuasimetricEstimation(Module):
     def __init__(
         self,
@@ -254,6 +302,13 @@ class MultistepQuasimetricEstimation(Module):
         self.waypoint_discount = waypoint_discount
         self.discount_factor = discount_factor
         self.next_timestep_prob = next_timestep_prob
+
+    def extract_policy(
+        self,
+        *args,
+        **kwargs
+    ):
+        return self.critic.extract_policy(*args, **kwargs)
 
     def forward(
         self,
@@ -359,7 +414,10 @@ class Policy(Module):
         self,
         *,
         action_dim,
+        dim = None,
         action_dist = None,
+        state_encoder = None,
+        goal_encoder = None,
         pretrained = False,
         mlp_depth = 3,
         mlp_hidden_dim = 256
@@ -367,25 +425,30 @@ class Policy(Module):
         super().__init__()
         self.action_dist = default(action_dist, ContinuousAction())
 
-        self.state_encoder = ResNet34Encoder(pretrained = pretrained, pool = False)
-        self.goal_encoder = ResNet34Encoder(pretrained = pretrained, pool = True)
+        self.state_encoder = default(state_encoder, ResNet34Encoder(pretrained = pretrained, pool = False))
+        self.goal_encoder = default(goal_encoder, ResNet34Encoder(pretrained = pretrained, pool = True))
 
-        dim = self.state_encoder.output_dim
+        if not exists(dim):
+            assert hasattr(self.state_encoder, 'output_dim'), 'dim must be given if using custom state_encoder'
+            dim = self.state_encoder.output_dim
+
         dim_out = action_dim * self.action_dist.expansion_factor
 
-        self.mlp = FiLMableMLP(
-            dim,
-            *((mlp_hidden_dim,) * mlp_depth),
-            dim_out,
+        self.mlp = create_filmable_mlp(
+            mlp_hidden_dim,
+            mlp_depth,
+            dim_in = dim,
+            dim_out = dim_out,
             cond_dim = dim
         )
 
     def forward(self, state, goal):
         state_tokens = self.state_encoder(state)
-        goal_embed = self.goal_encoder(goal)
+        goal_tokens = self.goal_encoder(goal)
 
-        embed = reduce(state_tokens, 'b n d -> b d', 'mean')
+        embed = reduce(state_tokens, 'b n d -> b d', 'mean') if state_tokens.ndim == 3 else state_tokens
+        cond = reduce(goal_tokens, 'b n d -> b d', 'mean') if goal_tokens.ndim == 3 else goal_tokens
 
-        out = self.mlp(embed, goal_embed)
+        out = self.mlp(embed, cond)
 
         return self.action_dist(out)

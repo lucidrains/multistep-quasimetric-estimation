@@ -4,22 +4,68 @@
 
 Exploration and eventually practical implementation for the [Multistep Quasimetric Estimation](https://arxiv.org/abs/2511.07730) proposed by Zheng et al. of Berkeley
 
+## Install
+
+```bash
+pip install MQE
+```
+
 ## Usage
 
 ```python
 import torch
-from MQE import Policy
+from torch import nn
 
-policy = Policy(
-    action_dim = 4,
-    is_continuous = True, # set to False for discrete categorical actions
-    pretrained = False    # whether to use ImageNet pretrained ResNet34 weights
+from MQE import MQE, MRN, Policy, ContinuousAction
+from x_mlps_pytorch import MLP
+
+state_dim, action_dim = 16, 4
+
+mrn = MRN(
+    sym_network = MLP(32, 64),
+    asym_network = MLP(32, 64),
+    distance_groups = 8
 )
 
-state_img = torch.randn(2, 3, 224, 224)
-goal_img = torch.randn(2, 3, 224, 224)
+mqe = MQE(
+    state_encoder = MLP(state_dim, 32),
+    state_action_encoder = MLP(state_dim + action_dim, 32),
+    metric_residual_network = mrn
+)
 
-actions = policy(state_img, goal_img) # (2, 4)
+policy = Policy(
+    action_dim = action_dim,
+    dim = 32,
+    state_encoder = MLP(state_dim, 32),
+    goal_encoder = MLP(state_dim, 32),
+    action_dist = ContinuousAction()
+)
+
+states = torch.randn(4, 10, state_dim)
+actions = torch.randn(4, 10, action_dim)
+goals = torch.randn(4, 10, state_dim)
+
+# train critic from offline trajectories
+
+critic_loss, _ = mqe(states, actions, goals)
+
+critic_loss.backward()
+
+# train actor using critic
+
+policy_loss, _ = mqe.extract_policy(
+    policy,
+    states,
+    actions,
+    goals,
+    bc_loss_weight = 0.1
+)
+
+policy_loss.backward()
+
+# inference
+
+action = policy(states[:, 0], goals[:, 0]).sample() # (4, 4)
 ```
 
 ## Citations
