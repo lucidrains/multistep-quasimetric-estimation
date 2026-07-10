@@ -25,28 +25,7 @@ def test_quasimetric_distance(
 
     assert dist.numel() == 1
 
-def test_mrn():
-    from x_mlps_pytorch import MLP
-    from MQE import MetricResidualNetwork
-
-    dim_state = 10
-    dim_action = 2
-    dim_goal = 10
-
-    mrn = MetricResidualNetwork(
-        encoders = [MLP(dim_state + dim_action, 32, 16), MLP(dim_goal, 32, 16)],
-        sym_network = MLP(16, 32),
-        asym_network = MLP(16, 32)
-    )
-
-    state = torch.randn(10)
-    actions = torch.rand(2)
-    goal = torch.randn(10)
-
-    distance = mrn((state, actions), goal)
-    distance.backward()
-
-def test_mqe():
+def test_critic():
     from x_mlps_pytorch import MLP
     from MQE import MQE, MRN
 
@@ -55,21 +34,19 @@ def test_mqe():
     dim_goal = 10
 
     mrn = MRN(
-        encoders = [MLP(dim_state + dim_action, 32, 16), MLP(dim_goal, 32, 16)],
         sym_network = MLP(16, 32),
         asym_network = MLP(16, 32)
     )
 
-    mqe = MQE(mrn)
+    mqe = MQE(
+        state_encoder = MLP(dim_goal, 32, 16),
+        state_action_encoder = MLP(dim_state + dim_action, 32, 16),
+        metric_residual_network = mrn
+    )
 
-    states = torch.randn(4, 10)
-    actions = torch.rand(4, 2)
-    goals = torch.randn(4, 10)
+    states = torch.randn(4, 10, dim_state)
+    actions = torch.rand(4, 10, dim_action)
+    goals = torch.randn(4, 10, dim_goal)
 
-    distance, action_inv_loss = mqe(states, actions, goals, return_action_invariance_loss=True)
-
-    assert distance.shape == (4,)
-    assert action_inv_loss.numel() == 1
-
-    loss = distance.mean() + action_inv_loss
+    loss, loss_breakdown = mqe(states, actions, goals)
     loss.backward()

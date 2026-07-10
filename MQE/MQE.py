@@ -1,7 +1,8 @@
 from __future__ import annotations
+from math import log
 
 import torch
-from torch import nn
+from torch import nn, tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
@@ -45,7 +46,7 @@ def quasimetric_distance(
 
     asym_x, asym_y = default(asym_x, x), default(asym_y, y)
 
-    assert x.shape == y.shape == asym_x.shape == asym_y.shape
+    assert x.shape[-1] == y.shape[-1] == asym_x.shape[-1] == asym_y.shape[-1]
     assert divisible_by(dim_embed, groups)
 
     # separate out groups
@@ -80,16 +81,11 @@ class MetricResidualNetwork(Module):
     def __init__(
         self,
         *,
-        encoders: tuple[Module, Module],
         sym_network: Module,
         asym_network: Module,
         distance_groups = 8
     ):
         super().__init__()
-
-        # encoders - would be state-action and state-goal for MEQ
-
-        self.encoders = ModuleList(list(encoders))
 
         # the two network backbones, producing inputs for symmetric and asymmetric half of quasimetric distance
 
@@ -102,55 +98,137 @@ class MetricResidualNetwork(Module):
 
     def forward(
         self,
-        *encoder_inputs,
-        calc_reverse_distance = False,
+        encoded_left,
+        encoded_right,
         reduce_groups = True
     ):
-        maybe_reverse = reversed if calc_reverse_distance else identity
-        encoded = [fn(inputs) for fn, inputs in maybe_reverse(list(zip(self.encoders, encoder_inputs)))]
+        encoded = [encoded_left, encoded_right]
 
         sym_x, sym_y = [self.sym_network(t) for t in encoded]
         asym_x, asym_y = [self.asym_network(t) for t in encoded]
 
         return quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups, reduce_groups = reduce_groups)
 
-# classes
+# critic
 
-class MultistepQuasimetricEstimation(Module):
+class Critic(Module):
     def __init__(
         self,
+        state_encoder: Module,
+        state_action_encoder: Module,
         metric_residual_network: MetricResidualNetwork,
+        discount_factor = 0.95
     ):
         super().__init__()
-        self.mrn = metric_residual_network
-
-    def calc_action_invariance_loss(
-        self,
-        states,
-        actions
-    ):
-        dist_action_invariance = self.mrn((states, actions), states, calc_reverse_distance = True, reduce_groups = False) # (... g)
-
-        # section 4.2
-
-        return F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
+        self.state_encoder = state_encoder
+        self.state_action_encoder = state_action_encoder
+        self.metric_residual_network = metric_residual_network
+        self.discount_factor = discount_factor
 
     def forward(
         self,
         states,
         actions,
         goals,
-        return_action_invariance_loss = False
+        waypoints,
+        waypoint_dist, # int(b)
     ):
+        γ = self.discount_factor
+        state_encoder, state_action_encoder, metric_residual_network = self.state_encoder, self.state_action_encoder, self.metric_residual_network
 
-        distance = self.mrn((states, actions), goals)
+        encoded_states = state_encoder(states)
+        encoded_state_actions = state_action_encoder((states, actions))
+        encoded_waypoints = state_encoder(waypoints)
+        encoded_goals = state_encoder(goals)
 
-        if not return_action_invariance_loss:
-            return distance
+        # eq (10)
 
-        loss_action_invariance = self.calc_action_invariance_loss(states, actions)
+        def linex_loss(d, d_target):
+            return (d - d_target).exp() - d_target
 
-        return distance, loss_action_invariance
+        # eq (11) - cross-batch goals
+
+        encoded_state_actions_i = rearrange(encoded_state_actions, 'i d -> i 1 d')
+        encoded_waypoints_i = rearrange(encoded_waypoints, 'i d -> i 1 d')
+        encoded_goals_j = rearrange(encoded_goals, 'j d -> 1 j d')
+
+        dist_q_to_goal = metric_residual_network(
+            encoded_state_actions_i,
+            encoded_goals_j
+        )
+
+        dist_waypoint_to_goal = metric_residual_network(
+            encoded_waypoints_i,
+            encoded_goals_j
+        )
+
+        waypoint_dist = rearrange(waypoint_dist, 'i -> i 1')
+
+        loss = linex_loss(dist_q_to_goal, dist_waypoint_to_goal - waypoint_dist * log(γ)).mean()
+
+        # section 4.2 - cross-batch action invariance
+
+        encoded_states_i = rearrange(encoded_states, 'i d -> i 1 d')
+        encoded_state_actions_j = rearrange(encoded_state_actions, 'j d -> 1 j d')
+
+        dist_action_invariance = metric_residual_network(
+            encoded_states_i,
+            encoded_state_actions_j,
+            reduce_groups = False
+        )
+
+        loss_action_invariance = F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
+
+        return loss + loss_action_invariance, (loss, loss_action_invariance)
+
+# classes
+
+class MultistepQuasimetricEstimation(Module):
+    def __init__(
+        self,
+        state_encoder: Module,
+        state_action_encoder: Module,
+        metric_residual_network: MetricResidualNetwork,
+        discount_factor = 0.95,
+        waypoint_discount = 0.95,
+        max_waypoint_dist = 10,
+        next_timestep_prob = 0.2
+    ):
+        super().__init__()
+
+        self.critic = Critic(
+            state_encoder = state_encoder,
+            state_action_encoder = state_action_encoder,
+            metric_residual_network = metric_residual_network,
+            discount_factor = discount_factor
+        )
+
+        self.max_waypoint_dist = max_waypoint_dist
+        self.waypoint_discount = waypoint_discount
+        self.discount_factor = discount_factor
+        self.next_timestep_prob = next_timestep_prob
+
+    def forward(
+        self,
+        states,
+        actions,
+        goals
+    ):
+        batch, timesteps, device = *states.shape[:2], states.device
+
+        is_next_timestep = torch.full((batch,), self.next_timestep_prob, device = device).bernoulli() == 1
+        max_waypoint = min(self.max_waypoint_dist, timesteps - 1)
+        waypoint_dist = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).clamp(1, max_waypoint)
+
+        waypoint_dist = torch.where(is_next_timestep, 1, waypoint_dist).long()
+
+        waypoint_indices = rearrange(waypoint_dist, 'b -> b 1')
+        batch_arange = rearrange(torch.arange(batch, device = device), 'b -> b 1')
+
+        waypoints = states[batch_arange, waypoint_indices]
+        waypoints = rearrange(waypoints, 'b 1 ... -> b ...')
+
+        return self.critic(states[:, 0], actions[:, 0], goals[:, -1], waypoints, waypoint_dist)
 
 # shorthand
 
