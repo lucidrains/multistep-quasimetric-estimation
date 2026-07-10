@@ -50,3 +50,37 @@ def test_critic():
 
     loss, loss_breakdown = mqe(states, actions, goals)
     loss.backward()
+
+def test_policy_discrete():
+    from MQE import Policy
+    from MQE.MQE import DiscreteAction
+
+    policy = Policy(
+        action_dim = 10,
+        action_dist = DiscreteAction()
+    )
+
+    state = torch.randn(2, 3, 224, 224)
+    goal = torch.randn(2, 3, 224, 224)
+
+    dist = policy(state, goal)
+    action = dist.sample()
+
+    assert action.shape == (2,)
+
+def test_policy_continuous():
+    from MQE import Policy
+    from MQE.MQE import ContinuousAction
+
+    policy = Policy(
+        action_dim = 4,
+        action_dist = ContinuousAction()
+    )
+
+    state = torch.randn(2, 3, 224, 224)
+    goal = torch.randn(2, 3, 224, 224)
+
+    dist = policy(state, goal)
+    action = dist.sample()
+
+    assert action.shape == (2, 4)

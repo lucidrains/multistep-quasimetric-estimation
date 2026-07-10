@@ -4,6 +4,24 @@
 
 Exploration and eventually practical implementation for the [Multistep Quasimetric Estimation](https://arxiv.org/abs/2511.07730) proposed by Zheng et al. of Berkeley
 
+## Usage
+
+```python
+import torch
+from MQE import Policy
+
+policy = Policy(
+    action_dim = 4,
+    is_continuous = True, # set to False for discrete categorical actions
+    pretrained = False    # whether to use ImageNet pretrained ResNet34 weights
+)
+
+state_img = torch.randn(2, 3, 224, 224)
+goal_img = torch.randn(2, 3, 224, 224)
+
+actions = policy(state_img, goal_img) # (2, 4)
+```
+
 ## Citations
 
 ```bibtex

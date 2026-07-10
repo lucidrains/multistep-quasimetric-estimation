@@ -1,6 +1,6 @@
 [project]
 name = "MQE"
-version = "0.0.10"
+version = "0.0.11"
 description = "Implementation of Multistep Quasimetric Estimator"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -26,7 +26,9 @@ dependencies = [
     "einx>=0.3.0",
     "einops>=0.8.1",
     "torch>=2.4",
+    "torchvision",
     "torch-einops-utils>=0.1.0",
+    "x-mlps-pytorch>=0.4.1",
 ]
 
 [project.urls]
@@ -36,8 +38,7 @@ Repository = "https://codeberg.org/lucidrains/MQE"
 [project.optional-dependencies]
 examples = []
 test = [
-    "pytest",
-    "x-mlps-pytorch"
+    "pytest"
 ]
 
 [tool.pytest.ini_options]

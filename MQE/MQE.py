@@ -1,12 +1,21 @@
 from __future__ import annotations
 from math import log
+from functools import partial
 
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch.nn import Module
+
+from torch.nn import Module, Linear
 
 from einops import rearrange, reduce
+from einops.layers.torch import Rearrange
+
+# policy related
+
+import torchvision.models as models
+from torch.distributions import Categorical, Normal, Beta
+from x_mlps_pytorch import FiLMableMLP
 
 # helpers
 
@@ -15,6 +24,10 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+# constants
+
+LinearNoBias = partial(Linear, bias = False)
 
 def identity(t):
     return t
@@ -213,7 +226,6 @@ class Critic(Module):
         return dist_q_to_goal.mean()
 
 # classes
-
 class MultistepQuasimetricEstimation(Module):
     def __init__(
         self,
@@ -269,3 +281,111 @@ class MultistepQuasimetricEstimation(Module):
 
 MRN = MetricResidualNetwork
 MQE = MultistepQuasimetricEstimation
+
+# policy
+
+class ResNet34Encoder(Module):
+    def __init__(
+        self,
+        *,
+        pretrained = False,
+        pool = True
+    ):
+        super().__init__()
+        resnet = models.resnet34(pretrained = pretrained)
+
+        modules = list(resnet.children())[:-1]
+
+        if not pool:
+            modules = modules[:-1]
+            modules.append(Rearrange('b c h w -> b (h w) c'))
+        else:
+            modules.append(Rearrange('b c 1 1 -> b c'))
+
+        self.encoder = nn.Sequential(*modules)
+
+    @property
+    def output_dim(self):
+        return 512
+
+    def forward(self, x):
+        return self.encoder(x)
+
+# action distributions
+
+class ActionDistribution(Module):
+    @property
+    def expansion_factor(self):
+        raise NotImplementedError
+
+    def forward(self, x):
+        raise NotImplementedError
+
+class DiscreteAction(ActionDistribution):
+    @property
+    def expansion_factor(self):
+        return 1
+
+    def forward(self, x):
+        return Categorical(logits = x)
+
+class ContinuousAction(ActionDistribution):
+    @property
+    def expansion_factor(self):
+        return 2
+
+    def forward(self, x):
+        mean, log_std = x.chunk(2, dim = -1)
+        return Normal(mean, log_std.exp())
+
+class BetaAction(ActionDistribution):
+    def __init__(self, eps = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    @property
+    def expansion_factor(self):
+        return 2
+
+    def forward(self, x):
+        alpha, beta = x.chunk(2, dim = -1)
+        alpha, beta = [F.softplus(t) + 1. + self.eps for t in (alpha, beta)]
+        return Beta(alpha, beta)
+
+# policy
+
+class Policy(Module):
+    def __init__(
+        self,
+        *,
+        action_dim,
+        action_dist = None,
+        pretrained = False,
+        mlp_depth = 3,
+        mlp_hidden_dim = 256
+    ):
+        super().__init__()
+        self.action_dist = default(action_dist, ContinuousAction())
+
+        self.state_encoder = ResNet34Encoder(pretrained = pretrained, pool = False)
+        self.goal_encoder = ResNet34Encoder(pretrained = pretrained, pool = True)
+
+        dim = self.state_encoder.output_dim
+        dim_out = action_dim * self.action_dist.expansion_factor
+
+        self.mlp = FiLMableMLP(
+            dim,
+            *((mlp_hidden_dim,) * mlp_depth),
+            dim_out,
+            cond_dim = dim
+        )
+
+    def forward(self, state, goal):
+        state_tokens = self.state_encoder(state)
+        goal_embed = self.goal_encoder(goal)
+
+        embed = reduce(state_tokens, 'b n d -> b d', 'mean')
+
+        out = self.mlp(embed, goal_embed)
+
+        return self.action_dist(out)
