@@ -2,7 +2,9 @@
 
 ## Multistep Quasimetric Estimation - (wip)
 
-Exploration and eventually practical implementation for the [Multistep Quasimetric Estimation](https://arxiv.org/abs/2511.07730) proposed by Zheng et al. of Berkeley
+Exploration and eventually practical implementation for the [Multistep Quasimetric Estimation](https://arxiv.org/abs/2511.07730) proposed by Zheng et al. of Berkeley.
+
+This paper is a coming together of a few ideas: quasimetric distance spaces and successor representations, along with an action invariance loss and other loss designs
 
 ## Install
 

@@ -19,6 +19,8 @@ from x_mlps_pytorch import create_filmable_mlp
 
 # helpers
 
+from torch_einops_utils import batched_index_select
+
 def exists(v):
     return v is not None
 
@@ -49,20 +51,11 @@ def quasimetric_distance(
     asym_y = None,
     *,
     sym_fn = default_sym_fn,
-    asym_fn = default_asym_fn,
-    groups = 8, # the paper splits the representation into N equally sized components (Table 2 uses 8)
-    reduce_groups = True
+    asym_fn = default_asym_fn
 ):
-    dim_embed = x.shape[-1]
-
     asym_x, asym_y = default(asym_x, x), default(asym_y, y)
 
     assert x.shape[-1] == y.shape[-1] == asym_x.shape[-1] == asym_y.shape[-1]
-    assert divisible_by(dim_embed, groups)
-
-    # separate out groups
-
-    x, y, asym_x, asym_y = (rearrange(t, '... (g d) -> ... g d', g = groups) for t in (x, y, asym_x, asym_y))
 
     # symmetric
 
@@ -76,14 +69,7 @@ def quasimetric_distance(
 
     distance = sym + asym
 
-    # maybe not reduce, for action invariance loss
-
-    if not reduce_groups:
-        return distance
-
-    # average
-
-    return reduce(distance, '... g -> ...', 'mean')
+    return distance
 
 # metric residual network
 # https://arxiv.org/abs/2208.08133
@@ -118,7 +104,17 @@ class MetricResidualNetwork(Module):
         sym_x, sym_y = [self.sym_network(t) for t in encoded]
         asym_x, asym_y = [self.asym_network(t) for t in encoded]
 
-        return quasimetric_distance(sym_x, sym_y, asym_x, asym_y, groups = self.distance_groups, reduce_groups = reduce_groups)
+        dim_embed = sym_x.shape[-1]
+        assert divisible_by(dim_embed, self.distance_groups)
+
+        sym_x, sym_y, asym_x, asym_y = (rearrange(t, '... (g d) -> ... g d', g = self.distance_groups) for t in (sym_x, sym_y, asym_x, asym_y))
+
+        distance = quasimetric_distance(sym_x, sym_y, asym_x, asym_y)
+
+        if not reduce_groups:
+            return distance
+
+        return reduce(distance, '... g -> ...', 'mean')
 
 # critic
 
@@ -194,6 +190,22 @@ class Critic(Module):
 
         return total_loss, (q_loss, bc_loss)
 
+    def actor_loss(
+        self,
+        states,
+        actions,
+        goals
+    ):
+        encoded_state_actions = self.state_action_encoder((states, actions))
+        encoded_goals = self.state_encoder(goals)
+
+        dist_q_to_goal = self.metric_residual_network(
+            encoded_state_actions,
+            encoded_goals
+        )
+
+        return dist_q_to_goal.mean()
+
     def forward(
         self,
         states,
@@ -256,22 +268,6 @@ class Critic(Module):
 
         return total_loss, (loss, loss_action_invariance)
 
-    def actor_loss(
-        self,
-        states,
-        actions,
-        goals
-    ):
-        encoded_state_actions = self.state_action_encoder((states, actions))
-        encoded_goals = self.state_encoder(goals)
-
-        dist_q_to_goal = self.metric_residual_network(
-            encoded_state_actions,
-            encoded_goals
-        )
-
-        return dist_q_to_goal.mean()
-
 # main classe
 
 class MultistepQuasimetricEstimation(Module):
@@ -318,17 +314,16 @@ class MultistepQuasimetricEstimation(Module):
     ):
         batch, timesteps, device = *states.shape[:2], states.device
 
+        # section 4.1 - multistep returns with quasimetric metric residual network
+
         is_next_timestep = torch.full((batch,), self.next_timestep_prob, device = device).bernoulli() == 1
         max_waypoint = min(self.max_waypoint_dist, timesteps - 1)
         waypoint_dist = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).clamp(1, max_waypoint)
-
         waypoint_dist = torch.where(is_next_timestep, 1, waypoint_dist).long()
 
-        waypoint_indices = rearrange(waypoint_dist, 'b -> b 1')
-        batch_arange = rearrange(torch.arange(batch, device = device), 'b -> b 1')
+        # waypoints selected, then waypoints and their sampled timesteps from starting state is used to calculate the loss
 
-        waypoints = states[batch_arange, waypoint_indices]
-        waypoints = rearrange(waypoints, 'b 1 ... -> b ...')
+        waypoints = batched_index_select(states, waypoint_dist)
 
         return self.critic(states[:, 0], actions[:, 0], goals[:, -1], waypoints, waypoint_dist)
 
