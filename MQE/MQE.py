@@ -2,13 +2,11 @@ from __future__ import annotations
 from math import log
 
 import torch
-from torch import nn, tensor
+from torch import nn
 import torch.nn.functional as F
-from torch.nn import Module, ModuleList
+from torch.nn import Module
 
 from einops import rearrange, reduce
-
-from x_mlps_pytorch import create_mlp
 
 # helpers
 
@@ -117,13 +115,24 @@ class Critic(Module):
         state_encoder: Module,
         state_action_encoder: Module,
         metric_residual_network: MetricResidualNetwork,
-        discount_factor = 0.95
+        discount_factor = 0.95,
+        action_invariance_loss_weight = 1.,
+        paired_loss_weight = 0.5
     ):
         super().__init__()
         self.state_encoder = state_encoder
         self.state_action_encoder = state_action_encoder
         self.metric_residual_network = metric_residual_network
+
+        # hyperparameters
+
         self.discount_factor = discount_factor
+
+        # loss related
+
+        self.action_invariance_loss_weight = action_invariance_loss_weight
+        self.paired_loss_weight = paired_loss_weight
+        self.has_paired_loss_weight = paired_loss_weight > 0
 
     def forward(
         self,
@@ -133,7 +142,7 @@ class Critic(Module):
         waypoints,
         waypoint_dist, # int(b)
     ):
-        γ = self.discount_factor
+        γ, batch = self.discount_factor, states.shape[0]
         state_encoder, state_action_encoder, metric_residual_network = self.state_encoder, self.state_action_encoder, self.metric_residual_network
 
         encoded_states = state_encoder(states)
@@ -144,7 +153,7 @@ class Critic(Module):
         # eq (10)
 
         def linex_loss(d, d_target):
-            return (d - d_target).exp() - d_target
+            return (d - d_target).exp() - d
 
         # eq (11) - cross-batch goals
 
@@ -164,22 +173,44 @@ class Critic(Module):
 
         waypoint_dist = rearrange(waypoint_dist, 'i -> i 1')
 
-        loss = linex_loss(dist_q_to_goal, dist_waypoint_to_goal - waypoint_dist * log(γ)).mean()
+        # handle loss
 
-        # section 4.2 - cross-batch action invariance
+        loss_matrix = linex_loss(dist_q_to_goal, dist_waypoint_to_goal.detach() - waypoint_dist * log(γ))
 
-        encoded_states_i = rearrange(encoded_states, 'i d -> i 1 d')
-        encoded_state_actions_j = rearrange(encoded_state_actions, 'j d -> 1 j d')
+        loss = loss_matrix.mean()
+
+        if self.has_paired_loss_weight:
+            loss = torch.lerp(loss, loss_matrix.diag().mean(), self.paired_loss_weight)
+
+        # section 4.2 - action invariance
 
         dist_action_invariance = metric_residual_network(
-            encoded_states_i,
-            encoded_state_actions_j,
+            encoded_states,
+            encoded_state_actions,
             reduce_groups = False
         )
 
         loss_action_invariance = F.mse_loss(dist_action_invariance.neg().exp(), torch.ones_like(dist_action_invariance))
 
-        return loss + loss_action_invariance, (loss, loss_action_invariance)
+        total_loss = loss + loss_action_invariance * self.action_invariance_loss_weight
+
+        return total_loss, (loss, loss_action_invariance)
+
+    def actor_loss(
+        self,
+        states,
+        actions,
+        goals
+    ):
+        encoded_state_actions = self.state_action_encoder((states, actions))
+        encoded_goals = self.state_encoder(goals)
+
+        dist_q_to_goal = self.metric_residual_network(
+            encoded_state_actions,
+            encoded_goals
+        )
+
+        return dist_q_to_goal.mean()
 
 # classes
 
@@ -192,7 +223,9 @@ class MultistepQuasimetricEstimation(Module):
         discount_factor = 0.95,
         waypoint_discount = 0.95,
         max_waypoint_dist = 10,
-        next_timestep_prob = 0.2
+        next_timestep_prob = 0.2,
+        action_invariance_loss_weight = 1.,
+        paired_loss_weight = 0.5
     ):
         super().__init__()
 
@@ -200,7 +233,9 @@ class MultistepQuasimetricEstimation(Module):
             state_encoder = state_encoder,
             state_action_encoder = state_action_encoder,
             metric_residual_network = metric_residual_network,
-            discount_factor = discount_factor
+            discount_factor = discount_factor,
+            action_invariance_loss_weight = action_invariance_loss_weight,
+            paired_loss_weight = paired_loss_weight
         )
 
         self.max_waypoint_dist = max_waypoint_dist
