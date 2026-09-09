@@ -421,26 +421,28 @@ class DiscreteAction(ActionDistribution):
         return Categorical(logits = x)
 
 class ContinuousAction(ActionDistribution):
+    def __init__(self, min_log_std = -5.0, max_log_std = 2.0):
+        super().__init__()
+        self.min_log_std = min_log_std
+        self.max_log_std = max_log_std
+
     @property
     def expansion_factor(self):
         return 2
 
     def forward(self, x):
         mean, log_std = x.chunk(2, dim = -1)
+        log_std = log_std.clamp(self.min_log_std, self.max_log_std)
         return Normal(mean, log_std.exp())
 
 class BetaAction(ActionDistribution):
-    def __init__(self, eps = 1e-5):
-        super().__init__()
-        self.eps = eps
-
     @property
     def expansion_factor(self):
         return 2
 
     def forward(self, x):
         alpha, beta = x.chunk(2, dim = -1)
-        alpha, beta = [F.softplus(t) + 1. + self.eps for t in (alpha, beta)]
+        alpha, beta = [F.softplus(t) + 1. for t in (alpha, beta)]
         return Beta(alpha, beta)
 
 # policy
