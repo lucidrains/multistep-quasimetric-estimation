@@ -3,7 +3,7 @@ from math import log
 from functools import partial
 
 import torch
-from torch import nn
+from torch import nn, is_tensor, tensor, Tensor
 import torch.nn.functional as F
 
 from torch.nn import Module, Linear
@@ -19,13 +19,29 @@ from x_mlps_pytorch import create_filmable_mlp
 
 # helpers
 
-from torch_einops_utils import batched_index_select
+from torch_einops_utils import batched_index_select, lens_to_mask
 
 def exists(v):
     return v is not None
 
 def default(v, d):
     return v if exists(v) else d
+
+def check_lens(lens, states):
+    if not exists(lens):
+        return None
+
+    timesteps, device = states.shape[1], states.device
+
+    lens = tensor(lens, device = device) if not is_tensor(lens) else lens.to(device)
+    lens = lens.long()
+
+    assert (lens <= timesteps).all(), f'all sequence lengths must be <= timesteps ({timesteps})'
+
+    mask = lens_to_mask(lens, max_len = timesteps)
+    assert mask[:, 1].all(), 'all sequences must have at least 2 timesteps'
+
+    return lens
 
 # constants
 
@@ -152,7 +168,8 @@ class Critic(Module):
         actions,
         goals,
         bc_loss_weight = 0.1,
-        is_image = False
+        is_image = False,
+        lens = None
     ):
         # extracts goal-conditioned policy using behavior-regularization
 
@@ -161,9 +178,13 @@ class Critic(Module):
         is_seq = states.ndim == (5 if is_image else 3)
 
         if is_seq:
+            lens = check_lens(lens, states)
+
+            if goals.ndim == states.ndim:
+                goals = batched_index_select(goals, lens - 1) if exists(lens) else goals[:, -1]
+
             states = states[:, 0]
             actions = actions[:, 0]
-            goals = goals[:, -1]
 
         # behavior cloning loss
 
@@ -278,7 +299,7 @@ class MultistepQuasimetricEstimation(Module):
         metric_residual_network: MetricResidualNetwork,
         discount_factor = 0.95,
         waypoint_discount = 0.95,
-        max_waypoint_dist = 10,
+        max_waypoint_dist = None,
         next_timestep_prob = 0.2,
         action_invariance_loss_weight = 1.,
         paired_loss_weight = 0.5
@@ -310,22 +331,42 @@ class MultistepQuasimetricEstimation(Module):
         self,
         states,
         actions,
-        goals
+        goals,
+        lens = None
     ):
         batch, timesteps, device = *states.shape[:2], states.device
+
+        assert timesteps >= 2, f'sequence must have at least 2 timesteps (got {timesteps})'
+
+        lens = check_lens(lens, states)
+
+        # max waypoint distance, capped at goal distance K (lens - 1 or timesteps - 1)
+
+        max_waypoint = (lens - 1) if exists(lens) else (timesteps - 1)
+
+        if exists(self.max_waypoint_dist):
+            max_waypoint = max_waypoint.clamp(max = self.max_waypoint_dist) if is_tensor(max_waypoint) else min(self.max_waypoint_dist, max_waypoint)
 
         # section 4.1 - multistep returns with quasimetric metric residual network
 
         is_next_timestep = torch.full((batch,), self.next_timestep_prob, device = device).bernoulli() == 1
-        max_waypoint = min(self.max_waypoint_dist, timesteps - 1)
-        waypoint_dist = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).clamp(1, max_waypoint)
-        waypoint_dist = torch.where(is_next_timestep, 1, waypoint_dist).long()
+
+        # eq. (8) of the paper - waypoint distance capped at the goal distance K, where the goal is the last frame of the trajectory window (k' ~ min(geometric(1 - lambda), K))
+
+        k_prime = torch.empty((batch,), device = device).geometric_(1. - self.waypoint_discount).long()
+        waypoint_dist = k_prime.clamp(max = max_waypoint)
+        waypoint_dist = torch.where(is_next_timestep, 1, waypoint_dist)
 
         # waypoints selected, then waypoints and their sampled timesteps from starting state is used to calculate the loss
 
         waypoints = batched_index_select(states, waypoint_dist)
 
-        return self.critic(states[:, 0], actions[:, 0], goals[:, -1], waypoints, waypoint_dist)
+        # select goal from last frame of episode (per sample if lens is given)
+
+        if goals.ndim == states.ndim:
+            goals = batched_index_select(goals, lens - 1) if exists(lens) else goals[:, -1]
+
+        return self.critic(states[:, 0], actions[:, 0], goals, waypoints, waypoint_dist)
 
 # shorthand
 

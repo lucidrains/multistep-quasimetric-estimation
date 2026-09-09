@@ -118,9 +118,84 @@ def test_policy_extraction():
     policy = DummyPolicy()
 
     states, goals = torch.randn(2, 4, dim_state)
-    actions = torch.randn(4, dim_action)
+    actions = torch.randn(2, 4, dim_action)
 
     total_loss, _ = mqe.extract_policy(policy, states, actions, goals)
 
     total_loss.backward()
     assert any(exists(p.grad) for p in policy.parameters())
+
+def test_variable_length_episodes():
+    from x_mlps_pytorch import MLP
+    from MQE import MQE, MRN
+
+    dim_state = 10
+    dim_action = 2
+    dim_goal = 10
+
+    mrn = MRN(
+        sym_network = MLP(16, 32),
+        asym_network = MLP(16, 32)
+    )
+
+    mqe = MQE(
+        state_encoder = MLP(dim_goal, 32, 16),
+        state_action_encoder = MLP(dim_state + dim_action, 32, 16),
+        metric_residual_network = mrn
+    )
+
+    batch, max_timesteps = 4, 15
+    states = torch.randn(batch, max_timesteps, dim_state)
+    actions = torch.rand(batch, max_timesteps, dim_action)
+    goals = torch.randn(batch, max_timesteps, dim_goal)
+    lens = torch.tensor([4, 8, 15, 2])
+
+    loss, _ = mqe(states, actions, goals, lens = lens)
+    loss.backward()
+
+    # also test with list of lens
+    loss_list, _ = mqe(states, actions, goals, lens = [4, 8, 15, 2])
+    assert not torch.isnan(loss_list)
+
+    # test error when a sequence has length < 2
+    with pytest.raises(AssertionError):
+        mqe(states, actions, goals, lens = [1, 5, 8, 10])
+
+def test_variable_length_policy_extraction():
+    from x_mlps_pytorch import MLP
+    from MQE import MQE, MRN, ContinuousAction
+
+    dim_state, dim_action = 16, 4
+
+    mrn = MRN(
+        sym_network = MLP(16, 32),
+        asym_network = MLP(16, 32)
+    )
+
+    mqe = MQE(
+        state_encoder = MLP(dim_state, 32, 16),
+        state_action_encoder = MLP(dim_state + dim_action, 32, 16),
+        metric_residual_network = mrn
+    )
+
+    class DummyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = MLP(dim_state * 2, dim_action * 2)
+
+        def forward(self, state, goal):
+            mean, log_std = self.net(torch.cat((state, goal), dim = -1)).chunk(2, dim = -1)
+            return ContinuousAction()(torch.cat((mean, log_std), dim = -1))
+
+    policy = DummyPolicy()
+
+    batch, max_timesteps = 4, 12
+    states = torch.randn(batch, max_timesteps, dim_state)
+    goals = torch.randn(batch, max_timesteps, dim_state)
+    actions = torch.randn(batch, max_timesteps, dim_action)
+    lens = torch.tensor([3, 6, 12, 4])
+
+    total_loss, _ = mqe.extract_policy(policy, states, actions, goals, lens = lens)
+    total_loss.backward()
+    assert any(exists(p.grad) for p in policy.parameters())
+
