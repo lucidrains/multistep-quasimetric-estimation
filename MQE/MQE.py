@@ -251,6 +251,28 @@ class Critic(Module):
 
         return dist_q_to_goal.mean()
 
+    # predicting distances
+
+    def predict_distance(
+        self,
+        states,
+        goals,
+        actions = None,
+        reduce_groups = True
+    ):
+        if exists(actions):
+            encoded_states = self.state_action_encoder((states, actions))
+        else:
+            encoded_states = self.state_encoder(states)
+
+        encoded_goals = self.state_encoder(goals)
+
+        return self.metric_residual_network(
+            encoded_states,
+            encoded_goals,
+            reduce_groups = reduce_groups
+        )
+
     def forward(
         self,
         states,
@@ -347,13 +369,34 @@ class MultistepQuasimetricEstimation(Module):
     ):
         return self.critic.extract_policy(*args, **kwargs)
 
+    # predicting distance and steps
+
+    def predict_distance(
+        self,
+        *args,
+        return_steps = False,
+        **kwargs
+    ):
+        dist = self.critic.predict_distance(*args, **kwargs)
+
+        if not return_steps:
+            return dist
+
+        # convert to expected steps: d = -k * log(γ)  =>  k = d / |log(γ)|
+
+        steps_per_unit = abs(log(self.discount_factor))
+        return dist / steps_per_unit
+
     def forward(
         self,
         states,
         actions,
-        goals,
+        goals = None,
         lens = None
     ):
+        # default goals to states (terminal frame of trajectory window) if not explicitly given
+
+        goals = default(goals, states)
         batch, timesteps, device = *states.shape[:2], states.device
 
         assert timesteps >= 2, f'sequence must have at least 2 timesteps (got {timesteps})'

@@ -1,3 +1,18 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "fire",
+#     "matplotlib",
+#     "numpy",
+#     "seaborn",
+#     "torch",
+#     "x-mlps-pytorch",
+#     "MQE",
+# ]
+# [tool.uv.sources]
+# MQE = { path = ".." }
+# ///
+
 """
 toy task showing the benefit of a learned quasimetric over a regular (unconstrained) distance space
 
@@ -6,16 +21,24 @@ the offline dataset is only short random walks on a branching maze, yet the quas
 run
 
     python examples/maze_stitching.py
+    # or
+    uv run examples/maze_stitching.py
 """
 
 import math
+from pathlib import Path
+from collections import deque
 import numpy as np
 import torch
 from torch import nn
-from collections import deque
+
+import fire
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 from x_mlps_pytorch import MLP
-
 from MQE import MQE, MRN
 
 # experiment configuration
@@ -32,7 +55,7 @@ WAYPOINT_DISCOUNT = 0.9
 
 GOAL_CELL = (1, 1)
 
-# a branching maze - reaching (1, 1) from (1, 7) requires backtracking
+# a maze with walls - inner corridors require navigating around barriers to reach (1, 1)
 
 MAZE = [
     '#########',
@@ -85,13 +108,13 @@ def bfs_distances(goal_cell):
 
 # offline data - short random walks only
 
-def collect_offline_data(seed):
+def collect_offline_data(num_segments, seg_len, seed):
     rng = np.random.RandomState(seed)
-    segments_s, segments_a = [], []
+    segments_s, segments_a, lens = [], [], []
 
-    for _ in range(NUM_SEGMENTS):
+    for _ in range(num_segments):
         cell = CELLS[rng.randint(len(CELLS))]
-        length = rng.randint(2, SEG_LEN + 1)
+        length = rng.randint(2, seg_len + 1)
 
         seg_s, seg_a = [cell], []
 
@@ -104,8 +127,9 @@ def collect_offline_data(seed):
 
         segments_s.append(seg_s)
         segments_a.append(seg_a)
+        lens.append(len(seg_s))
 
-    timesteps = SEG_LEN + 2
+    timesteps = max(lens)
 
     states = np.zeros((len(segments_s), timesteps, 2), dtype = np.float32)
     actions = np.zeros((len(segments_s), timesteps, 4), dtype = np.float32)
@@ -120,7 +144,7 @@ def collect_offline_data(seed):
         for t in range(timesteps):
             actions[i, t, seg_a[t]] = 1.
 
-    return torch.tensor(states), torch.tensor(actions)
+    return torch.from_numpy(states), torch.from_numpy(actions), torch.tensor(lens)
 
 # distance spaces
 
@@ -144,22 +168,32 @@ class UnconstrainedSpace(nn.Module):
         out = self.net(xy).squeeze(-1)
         return out if reduce_groups else out.unsqueeze(-1)
 
-def build_space(kind):
+def build_space(kind, embed_dim = EMBED_DIM, hidden_dim = HIDDEN_DIM):
     if kind == 'mqe':
         return MRN(
-            sym_network = MLP(EMBED_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM),
-            asym_network = MLP(EMBED_DIM, HIDDEN_DIM, HIDDEN_DIM, HIDDEN_DIM),
+            sym_network = MLP(embed_dim, hidden_dim, hidden_dim, hidden_dim),
+            asym_network = MLP(embed_dim, hidden_dim, hidden_dim, hidden_dim),
             distance_groups = 4
         )
 
     if kind == 'regular':
-        return UnconstrainedSpace(EMBED_DIM, HIDDEN_DIM)
+        return UnconstrainedSpace(embed_dim, hidden_dim)
 
     raise ValueError(f'unknown space {kind}')
 
 # training - identical multistep quasimetric objective for both spaces
 
-def train_critic(kind, states, actions, seed):
+def train_critic(
+    kind,
+    states,
+    actions,
+    lens,
+    seed = SEED,
+    critic_steps = CRITIC_STEPS,
+    batch_size = BATCH_SIZE,
+    discount_factor = DISCOUNT_FACTOR,
+    waypoint_discount = WAYPOINT_DISCOUNT
+):
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -167,8 +201,8 @@ def train_critic(kind, states, actions, seed):
         state_encoder = MLP(2, HIDDEN_DIM, HIDDEN_DIM, EMBED_DIM),
         state_action_encoder = MLP(2 + 4, HIDDEN_DIM, HIDDEN_DIM, EMBED_DIM),
         metric_residual_network = build_space(kind),
-        discount_factor = DISCOUNT_FACTOR,
-        waypoint_discount = WAYPOINT_DISCOUNT,
+        discount_factor = discount_factor,
+        waypoint_discount = waypoint_discount,
         action_invariance_loss_weight = 1.0,
         paired_loss_weight = 0.5
     )
@@ -176,9 +210,9 @@ def train_critic(kind, states, actions, seed):
     optimizer = torch.optim.Adam(mqe.parameters(), lr = 1e-3)
     num_segments = states.shape[0]
 
-    for _ in range(CRITIC_STEPS):
-        indices = torch.randint(0, num_segments, (BATCH_SIZE,))
-        loss, _ = mqe(states[indices], actions[indices], states[indices])
+    for _ in range(critic_steps):
+        indices = torch.randint(0, num_segments, (batch_size,))
+        loss, _ = mqe(states[indices], actions[indices], lens = lens[indices])
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(mqe.parameters(), 1.0)
@@ -190,18 +224,37 @@ def train_critic(kind, states, actions, seed):
 
 @torch.no_grad()
 def learned_distances(mqe, goal_cell):
-    goal = torch.tensor([encode(goal_cell)])
-    encoded_goal = mqe.critic.state_encoder(goal)
+    mqe.eval()
 
-    all_states = torch.tensor(np.stack([encode(cell) for cell in CELLS]))
-    encoded_states = mqe.critic.state_encoder(all_states)
+    goal = torch.from_numpy(encode(goal_cell)).unsqueeze(0)
+    all_states = torch.from_numpy(np.stack([encode(cell) for cell in CELLS]))
 
-    return mqe.critic.metric_residual_network(encoded_states, encoded_goal).numpy()
+    # predict expected steps: d = -k * log(γ)  =>  k = d / |log(γ)|
+
+    return mqe.predict_distance(all_states, goal, return_steps = True).numpy()
+
+def rankdata(a):
+    sorted_indices = np.argsort(a)
+    ranks = np.empty_like(sorted_indices, dtype = np.float64)
+    ranks[sorted_indices] = np.arange(1, len(a) + 1, dtype = np.float64)
+
+    unique, inverse, counts = np.unique(a, return_inverse = True, return_counts = True)
+    if len(unique) < len(a):
+        for i, count in enumerate(counts):
+            if count > 1:
+                ranks[inverse == i] = ranks[inverse == i].mean()
+
+    return ranks
 
 def spearman_correlation(x, y):
-    rank_x = np.argsort(np.argsort(x))
-    rank_y = np.argsort(np.argsort(y))
-    return np.corrcoef(rank_x, rank_y)[0, 1]
+    rank_x = rankdata(x)
+    rank_y = rankdata(y)
+    std_x, std_y = np.std(rank_x), np.std(rank_y)
+
+    if std_x < 1e-8 or std_y < 1e-8:
+        return 0.0
+
+    return float(np.corrcoef(rank_x, rank_y)[0, 1])
 
 def greedy_control_success(distances):
     """move to a neighboring cell strictly reducing the learned distance"""
@@ -233,64 +286,61 @@ def greedy_control_success(distances):
 
     return successes
 
-# plotting
+# plotting with seaborn
 
 def plot_results(true_dist, results, output_path):
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
+    fig, axes = plt.subplots(1, 4, figsize = (21, 5.2), dpi = 150)
 
-    _, axes = plt.subplots(1, 4, figsize = (21, 5.2), dpi = 150)
+    # rescaled learned distances share the units of the true distances (steps)
 
-    # rescaled learned distances share the units of the true distances
-    steps_per_unit = abs(math.log(DISCOUNT_FACTOR))
     true_steps = true_dist
-    mqe_steps = results['mqe']['distances'] / steps_per_unit
-    regular_steps = results['regular']['distances'] / steps_per_unit
+    mqe_steps = results['mqe']['distances']
+    regular_steps = results['regular']['distances']
     shared_vmax = max(true_steps.max(), mqe_steps.max(), 1e-6)
-
-    def draw_maze(ax, title):
-        for r in range(HEIGHT):
-            for c in range(WIDTH):
-                if MAZE[r][c] == '#':
-                    ax.add_patch(patches.Rectangle((c - 0.5, r - 0.5), 1, 1, facecolor = '#334155', edgecolor = '#1e293b'))
-        gr, gc = GOAL_CELL
-        ax.plot(gc, gr, marker = '*', markersize = 16, color = '#f43f5e', zorder = 5)
-        ax.set_xlim(-0.5, WIDTH - 0.5)
-        ax.set_ylim(HEIGHT - 0.5, -0.5)
-        ax.set_aspect('equal')
-        ax.set_xticks([]); ax.set_yticks([])
-        ax.set_title(title, fontsize = 12, fontweight = 'bold', pad = 10)
 
     def draw_heat(ax, values, title):
         grid = np.full((HEIGHT, WIDTH), np.nan)
         for i, (r, c) in enumerate(CELLS):
             grid[r, c] = values[i]
-        im = ax.imshow(grid, cmap = 'viridis', vmin = 0, vmax = shared_vmax)
-        draw_maze(ax, title)
-        cbar = plt.colorbar(im, ax = ax, fraction = 0.046, pad = 0.04)
-        cbar.set_label('distance (steps)', fontsize = 9)
+
+        sns.heatmap(
+            grid,
+            ax = ax,
+            cmap = 'viridis',
+            vmin = 0,
+            vmax = shared_vmax,
+            mask = np.isnan(grid),
+            cbar_kws = dict(label = 'distance (steps)', fraction = 0.046, pad = 0.04)
+        )
+        ax.set_facecolor('#334155')
+
+        gr, gc = GOAL_CELL
+        ax.plot(gc + 0.5, gr + 0.5, marker = '*', markersize = 16, color = '#f43f5e', zorder = 5)
+        ax.set_aspect('equal')
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(title, fontsize = 12, fontweight = 'bold', pad = 10)
 
     draw_heat(axes[0], true_steps, '1. True shortest-path distance')
     draw_heat(axes[1], mqe_steps, '2. MQE quasimetric MRN')
     draw_heat(axes[2], regular_steps, '3. Regular (unconstrained) space')
 
+    # panel 4: bar plot via seaborn
+    data = {
+        'Space': ['MQE (MRN)', 'MQE (MRN)', 'Regular', 'Regular'],
+        'Metric': ['Greedy control (% reached)', 'Rank correlation (%)', 'Greedy control (% reached)', 'Rank correlation (%)'],
+        'Score': [
+            results['mqe']['success'] / len(CELLS) * 100,
+            results['mqe']['spearman'] * 100,
+            results['regular']['success'] / len(CELLS) * 100,
+            results['regular']['spearman'] * 100
+        ]
+    }
     ax = axes[3]
-    labels = ['MQE\n(MRN)', 'Regular\n(unconstrained)']
-    x = np.arange(2)
-    success = np.array([results['mqe']['success'] / len(CELLS) * 100, results['regular']['success'] / len(CELLS) * 100])
-    corr = np.array([results['mqe']['spearman'], results['regular']['spearman']]) * 100
-
-    ax.bar(x - 0.2, success, width = 0.38, color = ['#10b981', '#dc2626'], label = 'Greedy control (% goals reached)')
-    ax.bar(x + 0.2, corr, width = 0.38, color = ['#6ee7b7', '#fca5a5'], label = 'Rank correlation with true distance')
-
-    for xpos, val in list(zip(x - 0.2, success)) + list(zip(x + 0.2, corr)):
-        offset = 3 if val >= 0 else -10
-        ax.text(xpos, val + offset, f'{val:.0f}', ha = 'center', fontsize = 10, fontweight = 'bold')
+    sns.barplot(data = data, x = 'Space', y = 'Score', hue = 'Metric', ax = ax, palette = ['#10b981', '#38bdf8'])
+    for container in ax.containers:
+        ax.bar_label(container, fmt = '%.0f', padding = 3, fontweight = 'bold')
 
     ax.axhline(0, color = '#334155', lw = 1)
-    ax.set_xticks(x); ax.set_xticklabels(labels)
     ax.set_ylim(-115, 118)
     ax.set_ylabel('%', fontsize = 10)
     ax.set_title('4. Stitching evaluation', fontsize = 12, fontweight = 'bold', pad = 10)
@@ -303,10 +353,19 @@ def plot_results(true_dist, results, output_path):
 
 # main
 
-def main():
+def main(
+    seed = SEED,
+    critic_steps = CRITIC_STEPS,
+    batch_size = BATCH_SIZE,
+    num_segments = NUM_SEGMENTS,
+    seg_len = SEG_LEN,
+    discount_factor = DISCOUNT_FACTOR,
+    waypoint_discount = WAYPOINT_DISCOUNT,
+    output_path = None
+):
     print('collecting short random-walk segments...')
-    states, actions = collect_offline_data(SEED)
-    print(f'  {len(states)} segments, at most {SEG_LEN} steps each')
+    states, actions, lens = collect_offline_data(num_segments, seg_len, seed)
+    print(f'  {len(states)} segments, at most {seg_len} steps each')
 
     true_dist_map = bfs_distances(GOAL_CELL)
     true_dist = np.array([true_dist_map[cell] for cell in CELLS], dtype = np.float32)
@@ -315,7 +374,17 @@ def main():
 
     for kind in ('mqe', 'regular'):
         print(f'training {kind} critic...')
-        mqe = train_critic(kind, states, actions, SEED)
+        mqe = train_critic(
+            kind,
+            states,
+            actions,
+            lens,
+            seed = seed,
+            critic_steps = critic_steps,
+            batch_size = batch_size,
+            discount_factor = discount_factor,
+            waypoint_discount = waypoint_discount
+        )
 
         distances = learned_distances(mqe, GOAL_CELL)
         success = greedy_control_success(distances)
@@ -329,9 +398,13 @@ def main():
     print(f'  MQE quasimetric MRN : {results["mqe"]["success"]}/{len(CELLS)} goals, rank corr {results["mqe"]["spearman"]:.3f}')
     print(f'  regular space       : {results["regular"]["success"]}/{len(CELLS)} goals, rank corr {results["regular"]["spearman"]:.3f}')
 
-    output_path = 'examples/maze_stitching.png'
+    if output_path is None:
+        output_path = Path(__file__).resolve().parent / 'maze_stitching.png'
+    else:
+        output_path = Path(output_path)
+
     plot_results(true_dist, results, output_path)
     print(f'\nsaved figure to {output_path}')
 
 if __name__ == '__main__':
-    main()
+    fire.Fire(main)

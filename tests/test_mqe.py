@@ -199,3 +199,33 @@ def test_variable_length_policy_extraction():
     total_loss.backward()
     assert any(exists(p.grad) for p in policy.parameters())
 
+def test_predict_distance():
+    from x_mlps_pytorch import MLP
+    from MQE import MQE, MRN
+
+    dim_state, dim_action = 10, 2
+
+    mrn = MRN(
+        sym_network = MLP(16, 32),
+        asym_network = MLP(16, 32)
+    )
+
+    mqe = MQE(
+        state_encoder = MLP(dim_state, 32, 16),
+        state_action_encoder = MLP(dim_state + dim_action, 32, 16),
+        metric_residual_network = mrn
+    )
+
+    states = torch.randn(4, 10, dim_state)
+    actions = torch.rand(4, 10, dim_action)
+
+    # implicit goals default to states
+    loss, _ = mqe(states, actions)
+    assert not torch.isnan(loss)
+
+    # predict_distance and return_steps
+    dists = mqe.predict_distance(states[:, 0], states[:, -1])
+    assert dists.shape == (4,)
+
+    steps = mqe.predict_distance(states[:, 0], states[:, -1], return_steps = True)
+    assert steps.shape == (4,)
