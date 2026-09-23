@@ -1,6 +1,6 @@
 from __future__ import annotations
 from math import log
-from functools import partial
+from functools import partial, wraps
 
 import torch
 from torch import nn, is_tensor, tensor, Tensor
@@ -52,6 +52,30 @@ def identity(t):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+# huberized linex
+
+def huberize(
+    clamp_max = 5.,
+    clamp_min = None
+):
+    # clip the argument of any convex loss on the residual, adding the displacement back as a linear tail
+
+    def decorator(loss_fn):
+        @wraps(loss_fn)
+        def huberized(residual):
+            clipped = residual.clamp(min = clamp_min, max = clamp_max)
+            return loss_fn(clipped) + (residual - clipped).abs()
+
+        return huberized
+
+    return decorator
+
+@huberize(clamp_max = 5.)
+def linex_loss(delta):
+    # eq (10) - the paper prints exp(d - d') - d', which has no minimum, so the intended form with gradient exp(d - d') - 1 is used
+
+    return delta.exp() - delta - 1
 
 # quasimetric distance
 
@@ -243,11 +267,6 @@ class Critic(Module):
         encoded_waypoints = state_encoder(waypoints)
         encoded_goals = state_encoder(goals)
 
-        # eq (10)
-
-        def linex_loss(d, d_target):
-            return (d - d_target).exp() - d
-
         # eq (11) - cross-batch goals
 
         encoded_state_actions_i = rearrange(encoded_state_actions, 'i d -> i 1 d')
@@ -268,7 +287,8 @@ class Critic(Module):
 
         # handle loss
 
-        loss_matrix = linex_loss(dist_q_to_goal, dist_waypoint_to_goal.detach() - waypoint_dist * log(γ))
+        residual = dist_q_to_goal - (dist_waypoint_to_goal.detach() - waypoint_dist * log(γ))
+        loss_matrix = linex_loss(residual)
 
         loss = loss_matrix.mean()
 
